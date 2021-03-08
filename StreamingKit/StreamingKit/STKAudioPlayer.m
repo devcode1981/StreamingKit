@@ -203,6 +203,7 @@ static AudioComponentDescription mixerDescription;
 static AudioComponentDescription nbandUnitDescription;
 static AudioComponentDescription outputUnitDescription;
 static AudioComponentDescription convertUnitDescription;
+static AudioComponentDescription playbackRateUnitDescription;
 static AudioStreamBasicDescription canonicalAudioStreamBasicDescription;
 static AudioStreamBasicDescription recordAudioStreamBasicDescription;
 
@@ -234,9 +235,11 @@ static AudioStreamBasicDescription recordAudioStreamBasicDescription;
 	AUNode eqOutputNode;
 	AUNode mixerInputNode;
 	AUNode mixerOutputNode;
+	AUNode playbackRateNode;
 	
     AudioComponentInstance eqUnit;
 	AudioComponentInstance mixerUnit;
+	AudioComponentInstance playbackRateUnit;
 	AudioComponentInstance outputUnit;
 		
     UInt32 eqBandCount;
@@ -252,8 +255,8 @@ static AudioStreamBasicDescription recordAudioStreamBasicDescription;
     NSMutableArray* upcomingQueue;
     NSMutableArray* bufferingQueue;
     
-    OSSpinLock pcmBufferSpinLock;
-    OSSpinLock internalStateLock;
+    os_unfair_lock pcmBufferSpinLock;
+    os_unfair_lock internalStateLock;
     volatile UInt32 pcmBufferTotalFrameCount;
     volatile UInt32 pcmBufferFrameStartIndex;
     volatile UInt32 pcmBufferUsedFrameCount;
@@ -283,11 +286,11 @@ static AudioStreamBasicDescription recordAudioStreamBasicDescription;
     UInt32 recordPacketSize;
     AudioStreamPacketDescription *recordPacketDescriptions;
     
-	void(^stopBackBackgroundTaskBlock)();
+	void(^stopBackBackgroundTaskBlock)(void);
     
     int32_t seekVersion;
-    OSSpinLock seekLock;
-    OSSpinLock currentEntryReferencesLock;
+    os_unfair_lock seekLock;
+    os_unfair_lock currentEntryReferencesLock;
 
     pthread_mutex_t playerMutex;
     pthread_cond_t playerThreadReadyCondition;
@@ -342,7 +345,16 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 #else
     const int bytesPerSample = sizeof(AudioSampleType);
 #endif
-    
+
+    playbackRateUnitDescription = (AudioComponentDescription)
+    {
+        .componentManufacturer	= kAudioUnitManufacturer_Apple,
+        .componentType			= kAudioUnitType_FormatConverter,
+        .componentSubType		= kAudioUnitSubType_AUiPodTimeOther,
+        .componentFlags			= 0,
+        .componentFlagsMask		= 0,
+    };
+
     canonicalAudioStreamBasicDescription = (AudioStreamBasicDescription)
     {
         .mSampleRate = 44100.00,
@@ -439,13 +451,13 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
             break;
     }
 	
-    OSSpinLockLock(&internalStateLock);
+    setLock(&internalStateLock);
 	
 	waitingForDataAfterSeekFrameCount = 0;
 	
     if (value == internalState)
     {
-        OSSpinLockUnlock(&internalStateLock);
+        lockUnlock(&internalStateLock);
         
         return;
     }
@@ -454,7 +466,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     {
         if (!ifInState(self->internalState))
         {
-            OSSpinLockUnlock(&internalStateLock);
+            lockUnlock(&internalStateLock);
             
             return;
         }
@@ -468,7 +480,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     {
         self.state = newState;
         
-        OSSpinLockUnlock(&internalStateLock);
+        lockUnlock(&internalStateLock);
         
         dispatch_async(dispatch_get_main_queue(), ^
         {
@@ -477,7 +489,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     }
     else
     {
-        OSSpinLockUnlock(&internalStateLock);
+        lockUnlock(&internalStateLock);
     }
 }
 
@@ -513,6 +525,11 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 {
     if (self = [super init])
     {
+        pcmBufferSpinLock = OS_UNFAIR_LOCK_INIT;
+        internalStateLock = OS_UNFAIR_LOCK_INIT;
+        seekLock = OS_UNFAIR_LOCK_INIT;
+        currentEntryReferencesLock = OS_UNFAIR_LOCK_INIT;
+
         options = optionsIn;
 		
 		self->volume = 1.0;
@@ -579,11 +596,9 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
         currentlyPlayingEntry.dataSource.delegate = nil;
         [currentlyReadingEntry.dataSource unregisterForEvents];
         
-        OSSpinLockLock(&currentEntryReferencesLock);
-        
+        setLock(&currentEntryReferencesLock);
 		currentlyPlayingEntry = nil;
-        
-        OSSpinLockUnlock(&currentEntryReferencesLock);
+        lockUnlock(&currentEntryReferencesLock);
     }
     
     [self closeRecordAudioFile];
@@ -678,6 +693,11 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     }
     
     return retval;
+}
+
++ (AudioStreamBasicDescription)canonicalAudioStreamBasicDescription
+{
+  return canonicalAudioStreamBasicDescription;
 }
 
 -(void) clearQueue
@@ -982,9 +1002,9 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
         return 0;
     }
     
-    OSSpinLockLock(&currentEntryReferencesLock);
+    setLock(&currentEntryReferencesLock);
     STKQueueEntry* entry = currentlyPlayingEntry;
-	OSSpinLockUnlock(&currentEntryReferencesLock);
+	lockUnlock(&currentEntryReferencesLock);
     
     if (entry == nil)
     {
@@ -1014,23 +1034,47 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
         return 0;
     }
     
-    OSSpinLockLock(&currentEntryReferencesLock);
+    setLock(&currentEntryReferencesLock);
     STKQueueEntry* entry = currentlyPlayingEntry;
-    OSSpinLockUnlock(&currentEntryReferencesLock);
+    lockUnlock(&currentEntryReferencesLock);
     
     if (entry == nil)
     {
         return 0;
     }
     
-    OSSpinLockLock(&entry->spinLock);
+    setLock(&entry->spinLock);
     double retval = entry->seekTime + (entry->framesPlayed / canonicalAudioStreamBasicDescription.mSampleRate);
-    OSSpinLockUnlock(&entry->spinLock);
+    lockUnlock(&entry->spinLock);
 	
     return retval;
 }
 
--(BOOL) invokeOnPlaybackThread:(void(^)())block
+-(float) rate
+{
+	AudioUnitParameterValue rateValue;
+	AudioUnitGetParameter(playbackRateUnit, kNewTimePitchParam_Rate, kAudioUnitScope_Global, 0, &rateValue);
+	return rateValue;
+}
+
+-(void) setRate:(float)rate
+{
+	AudioUnitSetParameter(playbackRateUnit, kNewTimePitchParam_Rate, kAudioUnitScope_Global, 0, rate, 0);
+}
+
+-(float) overlap
+{
+	AudioUnitParameterValue overlapValue;
+	AudioUnitGetParameter(playbackRateUnit, kNewTimePitchParam_Overlap, kAudioUnitScope_Global, 0, &overlapValue);
+	return overlapValue;
+}
+
+-(void) setOverlap:(float)overlap
+{
+	AudioUnitSetParameter(playbackRateUnit, kNewTimePitchParam_Overlap, kAudioUnitScope_Global, 0, overlap, 0);
+}
+
+-(BOOL) invokeOnPlaybackThread:(void(^)(void))block
 {
 	NSRunLoop* runLoop = playbackThreadRunLoop;
 	
@@ -1069,7 +1113,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
         return;
     }
     
-    OSSpinLockLock(&seekLock);
+    setLock(&seekLock);
     
     BOOL seekAlreadyRequested = seekToTimeWasRequested;
     
@@ -1080,14 +1124,14 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     {
         OSAtomicIncrement32(&seekVersion);
         
-        OSSpinLockUnlock(&seekLock);
+        lockUnlock(&seekLock);
         
         [self wakeupPlaybackThread];
         
         return;
     }
     
-    OSSpinLockUnlock(&seekLock);
+    lockUnlock(&seekLock);
 }
 
 -(void) createPlaybackThread
@@ -1138,9 +1182,9 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
         [currentlyReadingEntry.dataSource close];
     }
     
-    OSSpinLockLock(&currentEntryReferencesLock);
+    setLock(&currentEntryReferencesLock);
     currentlyReadingEntry = entry;
-    OSSpinLockUnlock(&currentEntryReferencesLock);
+    lockUnlock(&currentEntryReferencesLock);
     
     currentlyReadingEntry.dataSource.delegate = self;
     [currentlyReadingEntry.dataSource registerForEvents:[NSRunLoop currentRunLoop]];
@@ -1184,25 +1228,25 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     {
         if (!isPlayingSameItemProbablySeek)
         {
-            OSSpinLockLock(&next->spinLock);
+            setLock(&next->spinLock);
             next->seekTime = 0;
-            OSSpinLockUnlock(&next->spinLock);
+            lockUnlock(&next->spinLock);
             
-            OSSpinLockLock(&seekLock);
+            setLock(&seekLock);
             seekToTimeWasRequested = NO;
-            OSSpinLockUnlock(&seekLock);
+            lockUnlock(&seekLock);
         }
         
-        OSSpinLockLock(&currentEntryReferencesLock);
+        setLock(&currentEntryReferencesLock);
         currentlyPlayingEntry = next;
         NSObject* playingQueueItemId = playingQueueItemId = currentlyPlayingEntry.queueItemId;
-        OSSpinLockUnlock(&currentEntryReferencesLock);
+        lockUnlock(&currentEntryReferencesLock);
         
         if (!isPlayingSameItemProbablySeek && entry)
         {
             [self playbackThreadQueueMainThreadSyncBlock:^
             {
-                [self.delegate audioPlayer:self didFinishPlayingQueueItemId:queueItemId withReason:stopReason andProgress:progress andDuration:duration];
+                [self.delegate audioPlayer:self didFinishPlayingQueueItemId:queueItemId withReason:self->stopReason andProgress:progress andDuration:duration];
             }];
         }
         
@@ -1218,15 +1262,15 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     }
     else
     {
-        OSSpinLockLock(&currentEntryReferencesLock);
+        setLock(&currentEntryReferencesLock);
 		currentlyPlayingEntry = nil;
-        OSSpinLockUnlock(&currentEntryReferencesLock);
+        lockUnlock(&currentEntryReferencesLock);
         
         if (!isPlayingSameItemProbablySeek && entry)
         {
             [self playbackThreadQueueMainThreadSyncBlock:^
             {
-				[self.delegate audioPlayer:self didFinishPlayingQueueItemId:queueItemId withReason:stopReason andProgress:progress andDuration:duration];
+				[self.delegate audioPlayer:self didFinishPlayingQueueItemId:queueItemId withReason:self->stopReason andProgress:progress andDuration:duration];
             }];
         }
     }
@@ -1234,7 +1278,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     [self wakeupPlaybackThread];
 }
 
--(void) dispatchSyncOnMainThread:(void(^)())block
+-(void) dispatchSyncOnMainThread:(void(^)(void))block
 {
 	__block BOOL finished = NO;
 
@@ -1245,15 +1289,15 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 
 	dispatch_async(dispatch_get_main_queue(), ^
 	{
-		if (!disposeWasRequested)
+		if (!self->disposeWasRequested)
 		{
 			block();
 		}
 
-		pthread_mutex_lock(&mainThreadSyncCallMutex);
+		pthread_mutex_lock(&self->mainThreadSyncCallMutex);
 		finished = YES;
-		pthread_cond_signal(&mainThreadSyncCallReadyCondition);
-		pthread_mutex_unlock(&mainThreadSyncCallMutex);
+		pthread_cond_signal(&self->mainThreadSyncCallReadyCondition);
+		pthread_mutex_unlock(&self->mainThreadSyncCallMutex);
 	});
 
     pthread_mutex_lock(&mainThreadSyncCallMutex);
@@ -1276,13 +1320,13 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     pthread_mutex_unlock(&mainThreadSyncCallMutex);
 }
 
--(void) playbackThreadQueueMainThreadSyncBlock:(void(^)())block
+-(void) playbackThreadQueueMainThreadSyncBlock:(void(^)(void))block
 {
     block = [block copy];
     
     [self invokeOnPlaybackThread:^
     {
-        if (disposeWasRequested)
+        if (self->disposeWasRequested)
         {
             return;
         }
@@ -1382,21 +1426,21 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
             int32_t originalSeekVersion;
             BOOL originalSeekToTimeRequested;
 
-            OSSpinLockLock(&seekLock);
+            setLock(&seekLock);
             originalSeekVersion = seekVersion;
             originalSeekToTimeRequested = seekToTimeWasRequested;
-            OSSpinLockUnlock(&seekLock);
+            lockUnlock(&seekLock);
             
             if (originalSeekToTimeRequested && currentlyReadingEntry == currentlyPlayingEntry)
             {
                 [self processSeekToTime];
                 
-                OSSpinLockLock(&seekLock);
+                setLock(&seekLock);
                 if (originalSeekVersion == seekVersion)
                 {
                     seekToTimeWasRequested = NO;
                 }
-                OSSpinLockUnlock(&seekLock);
+                lockUnlock(&seekLock);
             }
         }
         else if (currentlyPlayingEntry == nil && seekToTimeWasRequested)
@@ -1445,10 +1489,10 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 		currentlyPlayingEntry.dataSource.delegate = nil;
 		
         pthread_mutex_lock(&playerMutex);
-        OSSpinLockLock(&currentEntryReferencesLock);
+        setLock(&currentEntryReferencesLock);
 		currentlyPlayingEntry = nil;
 		currentlyReadingEntry = nil;
-        OSSpinLockUnlock(&currentEntryReferencesLock);
+        lockUnlock(&currentEntryReferencesLock);
         pthread_mutex_unlock(&playerMutex);
         
         [self closeRecordAudioFile];
@@ -1483,9 +1527,9 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
         seekByteOffset = currentEntry.dataSource.length - 2 * currentEntry->packetBufferSize;
     }
     
-    OSSpinLockLock(&currentEntry->spinLock);
+    setLock(&currentEntry->spinLock);
     currentEntry->seekTime = requestedSeekTime;
-    OSSpinLockUnlock(&currentEntry->spinLock);
+    lockUnlock(&currentEntry->spinLock);
     
     double calculatedBitRate = [currentEntry calculatedBitRate];
     
@@ -1502,9 +1546,9 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
             if (!(ioFlags & kAudioFileStreamSeekFlag_OffsetIsEstimated)) {
                 double delta = ((seekByteOffset - (SInt64)currentEntry->audioDataOffset) - packetAlignedByteOffset) / calculatedBitRate * 8;
 
-                OSSpinLockLock(&currentEntry->spinLock);
+                setLock(&currentEntry->spinLock);
                 currentEntry->seekTime -= delta;
-                OSSpinLockUnlock(&currentEntry->spinLock);
+                lockUnlock(&currentEntry->spinLock);
             }
         }
     }
@@ -1598,7 +1642,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
             return;
         }
         
-        OSSpinLockLock(&currentEntryReferencesLock);
+        setLock(&currentEntryReferencesLock);
         
         if (currentlyReadingEntry == nil)
         {
@@ -1606,7 +1650,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
             [dataSourceIn close];
         }
         
-        OSSpinLockUnlock(&currentEntryReferencesLock);
+        lockUnlock(&currentEntryReferencesLock);
     }
 }
 
@@ -1656,17 +1700,17 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
         return;
     }
     
-    OSSpinLockLock(&currentlyReadingEntry->spinLock);
+    setLock(&currentlyReadingEntry->spinLock);
     currentlyReadingEntry->lastFrameQueued = currentlyReadingEntry->framesQueued;
-    OSSpinLockUnlock(&currentlyReadingEntry->spinLock);
+    lockUnlock(&currentlyReadingEntry->spinLock);
     
     currentlyReadingEntry.dataSource.delegate = nil;
     [currentlyReadingEntry.dataSource unregisterForEvents];
     [currentlyReadingEntry.dataSource close];
     
-    OSSpinLockLock(&currentEntryReferencesLock);
+    setLock(&currentEntryReferencesLock);
     currentlyReadingEntry = nil;
-    OSSpinLockUnlock(&currentEntryReferencesLock);
+    lockUnlock(&currentEntryReferencesLock);
     
     pthread_mutex_unlock(&playerMutex);
     
@@ -1747,7 +1791,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 
 -(void) resetPcmBuffers
 {
-    OSSpinLockLock(&pcmBufferSpinLock);
+    setLock(&pcmBufferSpinLock);
     
     self->pcmBufferFrameStartIndex = 0;
     self->pcmBufferUsedFrameCount = 0;
@@ -1756,7 +1800,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 	self->averagePowerDb[0] = STK_DBMIN;
 	self->averagePowerDb[1] = STK_DBMIN;
     
-    OSSpinLockUnlock(&pcmBufferSpinLock);
+    lockUnlock(&pcmBufferSpinLock);
 }
 
 -(void) stop
@@ -1778,26 +1822,26 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 		
         [self invokeOnPlaybackThread:^
         {
-            pthread_mutex_lock(&playerMutex);
+            pthread_mutex_lock(&self->playerMutex);
             {
-                currentlyReadingEntry.dataSource.delegate = nil;
-                [currentlyReadingEntry.dataSource unregisterForEvents];
-                [currentlyReadingEntry.dataSource close];
+                self->currentlyReadingEntry.dataSource.delegate = nil;
+                [self->currentlyReadingEntry.dataSource unregisterForEvents];
+                [self->currentlyReadingEntry.dataSource close];
                 
-                if (currentlyPlayingEntry)
+                if (self->currentlyPlayingEntry)
                 {
-                    [self processFinishPlayingIfAnyAndPlayingNext:currentlyPlayingEntry withNext:nil];
+                    [self processFinishPlayingIfAnyAndPlayingNext:self->currentlyPlayingEntry withNext:nil];
                 }
                 
                 [self clearQueue];
                 
-                OSSpinLockLock(&currentEntryReferencesLock);
-                currentlyPlayingEntry = nil;
-                currentlyReadingEntry = nil;
-                seekToTimeWasRequested = NO;
-                OSSpinLockUnlock(&currentEntryReferencesLock);
+                setLock(&self->currentEntryReferencesLock);
+                self->currentlyPlayingEntry = nil;
+                self->currentlyReadingEntry = nil;
+                self->seekToTimeWasRequested = NO;
+                lockUnlock(&self->currentEntryReferencesLock);
             }
-            pthread_mutex_unlock(&playerMutex);
+            pthread_mutex_unlock(&self->playerMutex);
         }];
         
 		[self wakeupPlaybackThread];
@@ -1817,7 +1861,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
         
         [self invokeOnPlaybackThread:^
         {
-            disposeWasRequested = YES;
+            self->disposeWasRequested = YES;
             
             CFRunLoopStop(CFRunLoopGetCurrent());
         }];
@@ -1903,20 +1947,20 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 
 -(NSObject*) currentlyPlayingQueueItemId
 {
-    OSSpinLockLock(&currentEntryReferencesLock);
+    setLock(&currentEntryReferencesLock);
     
     STKQueueEntry* entry = currentlyPlayingEntry;
     
     if (entry == nil)
     {
-        OSSpinLockUnlock(&currentEntryReferencesLock);
+        lockUnlock(&currentEntryReferencesLock);
         
         return nil;
     }
     
     NSObject* retval = entry.queueItemId;
     
-    OSSpinLockUnlock(&currentEntryReferencesLock);
+    lockUnlock(&currentEntryReferencesLock);
     
     return retval;
 }
@@ -2052,7 +2096,7 @@ static BOOL GetHardwareCodecClassDesc(UInt32 formatId, AudioClassDescription* cl
             return;
         }
         
-        status = AudioConverterSetProperty(audioConverterRef, kAudioConverterDecompressionMagicCookie, cookieSize, &cookieData);
+        status = AudioConverterSetProperty(audioConverterRef, kAudioConverterDecompressionMagicCookie, cookieSize, cookieData);
         
         if (status)
         {
@@ -2137,6 +2181,22 @@ static BOOL GetHardwareCodecClassDesc(UInt32 formatId, AudioClassDescription* cl
             [self closeRecordAudioFile];
         }
     }
+}
+
+-(void) createPlaybackRateUnit
+{
+    OSStatus status;
+    
+    CHECK_STATUS_AND_RETURN(AUGraphAddNode(audioGraph, &playbackRateUnitDescription, &playbackRateNode));
+    CHECK_STATUS_AND_RETURN(AUGraphNodeInfo(audioGraph, playbackRateNode, &playbackRateUnitDescription, &playbackRateUnit));
+    
+    //maxframes changed here
+    CHECK_STATUS_AND_RETURN(AudioUnitSetProperty(playbackRateUnit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maxFramesPerSlice, sizeof(maxFramesPerSlice)));
+#if TARGET_OS_IPHONE
+    CHECK_STATUS_AND_RETURN(AudioUnitSetParameter(playbackRateUnit, kNewTimePitchParam_Rate, kAudioUnitScope_Global, 0, 1, 0));
+#endif
+    
+  CHECK_STATUS_AND_RETURN(AudioUnitSetProperty(playbackRateUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, kOutputBus, &canonicalAudioStreamBasicDescription, sizeof(canonicalAudioStreamBasicDescription)));
 }
 
 -(void) createOutputUnit
@@ -2317,6 +2377,7 @@ static BOOL GetHardwareCodecClassDesc(UInt32 formatId, AudioClassDescription* cl
 	
 	[self createEqUnit];
 	[self createMixerUnit];
+	[self createPlaybackRateUnit];
 	[self createOutputUnit];
     
     [self connectGraph];
@@ -2365,7 +2426,13 @@ static BOOL GetHardwareCodecClassDesc(UInt32 formatId, AudioClassDescription* cl
         [nodes addObject:@(mixerNode)];
         [units addObject:[NSValue valueWithPointer:mixerUnit]];
     }
-	
+
+    if (playbackRateNode)
+    {
+        [nodes addObject:@(playbackRateNode)];
+        [units addObject:[NSValue valueWithPointer:playbackRateUnit]];
+    }
+
     if (outputNode)
     {
         [nodes addObject:@(outputNode)];
@@ -2559,12 +2626,12 @@ OSStatus AudioConverterCallback(AudioConverterRef inAudioConverter, UInt32* ioNu
     
     while (true)
     {
-        OSSpinLockLock(&pcmBufferSpinLock);
+        setLock(&pcmBufferSpinLock);
         UInt32 used = pcmBufferUsedFrameCount;
         UInt32 start = pcmBufferFrameStartIndex;
         UInt32 end = (pcmBufferFrameStartIndex + pcmBufferUsedFrameCount) % pcmBufferTotalFrameCount;
         UInt32 framesLeftInsideBuffer = pcmBufferTotalFrameCount - used;
-        OSSpinLockUnlock(&pcmBufferSpinLock);
+        lockUnlock(&pcmBufferSpinLock);
         
         if (framesLeftInsideBuffer == 0)
         {
@@ -2572,12 +2639,12 @@ OSStatus AudioConverterCallback(AudioConverterRef inAudioConverter, UInt32* ioNu
             
             while (true)
             {
-                OSSpinLockLock(&pcmBufferSpinLock);
+                setLock(&pcmBufferSpinLock);
                 used = pcmBufferUsedFrameCount;
                 start = pcmBufferFrameStartIndex;
                 end = (pcmBufferFrameStartIndex + pcmBufferUsedFrameCount) % pcmBufferTotalFrameCount;
                 framesLeftInsideBuffer = pcmBufferTotalFrameCount - used;
-                OSSpinLockUnlock(&pcmBufferSpinLock);
+                lockUnlock(&pcmBufferSpinLock);
 
                 if (framesLeftInsideBuffer > 0)
                 {
@@ -2639,13 +2706,13 @@ OSStatus AudioConverterCallback(AudioConverterRef inAudioConverter, UInt32* ioNu
 
             if (status == 100)
             {
-                OSSpinLockLock(&pcmBufferSpinLock);
+                setLock(&pcmBufferSpinLock);
                 pcmBufferUsedFrameCount += framesAdded;
-                OSSpinLockUnlock(&pcmBufferSpinLock);
+                lockUnlock(&pcmBufferSpinLock);
 
-                OSSpinLockLock(&currentlyReadingEntry->spinLock);
+                setLock(&currentlyReadingEntry->spinLock);
                 currentlyReadingEntry->framesQueued += framesAdded;
-                OSSpinLockUnlock(&currentlyReadingEntry->spinLock);
+                lockUnlock(&currentlyReadingEntry->spinLock);
                 
                 return;
             }
@@ -2660,13 +2727,13 @@ OSStatus AudioConverterCallback(AudioConverterRef inAudioConverter, UInt32* ioNu
             
             if (framesToDecode == 0)
             {
-                OSSpinLockLock(&pcmBufferSpinLock);
+                setLock(&pcmBufferSpinLock);
                 pcmBufferUsedFrameCount += framesAdded;
-                OSSpinLockUnlock(&pcmBufferSpinLock);
+                lockUnlock(&pcmBufferSpinLock);
                 
-                OSSpinLockLock(&currentlyReadingEntry->spinLock);
+                setLock(&currentlyReadingEntry->spinLock);
                 currentlyReadingEntry->framesQueued += framesAdded;
-                OSSpinLockUnlock(&currentlyReadingEntry->spinLock);
+                lockUnlock(&currentlyReadingEntry->spinLock);
                 
                 continue;
             }
@@ -2686,25 +2753,25 @@ OSStatus AudioConverterCallback(AudioConverterRef inAudioConverter, UInt32* ioNu
             
             if (status == 100)
             {
-                OSSpinLockLock(&pcmBufferSpinLock);
+                setLock(&pcmBufferSpinLock);
                 pcmBufferUsedFrameCount += framesAdded;
-                OSSpinLockUnlock(&pcmBufferSpinLock);
+                lockUnlock(&pcmBufferSpinLock);
                 
-                OSSpinLockLock(&currentlyReadingEntry->spinLock);
+                setLock(&currentlyReadingEntry->spinLock);
                 currentlyReadingEntry->framesQueued += framesAdded;
-                OSSpinLockUnlock(&currentlyReadingEntry->spinLock);
+                lockUnlock(&currentlyReadingEntry->spinLock);
                 
                 return;
             }
             else if (status == 0)
             {
-                OSSpinLockLock(&pcmBufferSpinLock);
+                setLock(&pcmBufferSpinLock);
                 pcmBufferUsedFrameCount += framesAdded;
-                OSSpinLockUnlock(&pcmBufferSpinLock);
+                lockUnlock(&pcmBufferSpinLock);
                 
-                OSSpinLockLock(&currentlyReadingEntry->spinLock);
+                setLock(&currentlyReadingEntry->spinLock);
                 currentlyReadingEntry->framesQueued += framesAdded;
-                OSSpinLockUnlock(&currentlyReadingEntry->spinLock);
+                lockUnlock(&currentlyReadingEntry->spinLock);
                 
                 continue;
             }
@@ -2735,25 +2802,25 @@ OSStatus AudioConverterCallback(AudioConverterRef inAudioConverter, UInt32* ioNu
             
             if (status == 100)
             {
-                OSSpinLockLock(&pcmBufferSpinLock);
+                setLock(&pcmBufferSpinLock);
                 pcmBufferUsedFrameCount += framesAdded;
-                OSSpinLockUnlock(&pcmBufferSpinLock);
+                lockUnlock(&pcmBufferSpinLock);
                 
-                OSSpinLockLock(&currentlyReadingEntry->spinLock);
+                setLock(&currentlyReadingEntry->spinLock);
                 currentlyReadingEntry->framesQueued += framesAdded;
-                OSSpinLockUnlock(&currentlyReadingEntry->spinLock);
+                lockUnlock(&currentlyReadingEntry->spinLock);
                 
                 return;
             }
             else if (status == 0)
             {
-                OSSpinLockLock(&pcmBufferSpinLock);
+                setLock(&pcmBufferSpinLock);
                 pcmBufferUsedFrameCount += framesAdded;
-                OSSpinLockUnlock(&pcmBufferSpinLock);
+                lockUnlock(&pcmBufferSpinLock);
                 
-                OSSpinLockLock(&currentlyReadingEntry->spinLock);
+                setLock(&currentlyReadingEntry->spinLock);
                 currentlyReadingEntry->framesQueued += framesAdded;
-                OSSpinLockUnlock(&currentlyReadingEntry->spinLock);
+                lockUnlock(&currentlyReadingEntry->spinLock);
 
                 continue;
             }
@@ -2831,12 +2898,12 @@ static OSStatus OutputRenderCallback(void* inRefCon, AudioUnitRenderActionFlags*
 {
     STKAudioPlayer* audioPlayer = (__bridge STKAudioPlayer*)inRefCon;
 
-    OSSpinLockLock(&audioPlayer->currentEntryReferencesLock);
+    setLock(&audioPlayer->currentEntryReferencesLock);
 	STKQueueEntry* entry = audioPlayer->currentlyPlayingEntry;
     STKQueueEntry* currentlyReadingEntry = audioPlayer->currentlyReadingEntry;
-    OSSpinLockUnlock(&audioPlayer->currentEntryReferencesLock);
+    lockUnlock(&audioPlayer->currentEntryReferencesLock);
     
-    OSSpinLockLock(&audioPlayer->pcmBufferSpinLock);
+    setLock(&audioPlayer->pcmBufferSpinLock);
     
     BOOL waitForBuffer = NO;
 	BOOL muted = audioPlayer->muted;
@@ -2896,7 +2963,7 @@ static OSStatus OutputRenderCallback(void* inRefCon, AudioUnitRenderActionFlags*
 		}
 	}
     
-    OSSpinLockUnlock(&audioPlayer->pcmBufferSpinLock);
+    lockUnlock(&audioPlayer->pcmBufferSpinLock);
     
     UInt32 totalFramesCopied = 0;
     
@@ -2929,10 +2996,10 @@ static OSStatus OutputRenderCallback(void* inRefCon, AudioUnitRenderActionFlags*
             
             totalFramesCopied = framesToCopy;
             
-            OSSpinLockLock(&audioPlayer->pcmBufferSpinLock);
+            setLock(&audioPlayer->pcmBufferSpinLock);
             audioPlayer->pcmBufferFrameStartIndex = (audioPlayer->pcmBufferFrameStartIndex + totalFramesCopied) % audioPlayer->pcmBufferTotalFrameCount;
             audioPlayer->pcmBufferUsedFrameCount -= totalFramesCopied;
-            OSSpinLockUnlock(&audioPlayer->pcmBufferSpinLock);
+            lockUnlock(&audioPlayer->pcmBufferSpinLock);
         }
         else
         {
@@ -2972,10 +3039,10 @@ static OSStatus OutputRenderCallback(void* inRefCon, AudioUnitRenderActionFlags*
             
             totalFramesCopied = framesToCopy + moreFramesToCopy;
             
-            OSSpinLockLock(&audioPlayer->pcmBufferSpinLock);
+            setLock(&audioPlayer->pcmBufferSpinLock);
             audioPlayer->pcmBufferFrameStartIndex = (audioPlayer->pcmBufferFrameStartIndex + totalFramesCopied) % audioPlayer->pcmBufferTotalFrameCount;
             audioPlayer->pcmBufferUsedFrameCount -= totalFramesCopied;
-            OSSpinLockUnlock(&audioPlayer->pcmBufferSpinLock);
+            lockUnlock(&audioPlayer->pcmBufferSpinLock);
         }
         
         [audioPlayer setInternalState:STKAudioPlayerInternalStatePlaying ifInState:^BOOL(STKAudioPlayerInternalState state)
@@ -3049,7 +3116,7 @@ static OSStatus OutputRenderCallback(void* inRefCon, AudioUnitRenderActionFlags*
         return 0;
     }
     
-    OSSpinLockLock(&entry->spinLock);
+    setLock(&entry->spinLock);
 	
     SInt64 extraFramesPlayedNotAssigned = 0;
     SInt64 framesPlayedForCurrent = totalFramesCopied;
@@ -3064,15 +3131,15 @@ static OSStatus OutputRenderCallback(void* inRefCon, AudioUnitRenderActionFlags*
     
     BOOL lastFramePlayed = entry->framesPlayed == entry->lastFrameQueued;
 
-    OSSpinLockUnlock(&entry->spinLock);
+    lockUnlock(&entry->spinLock);
     
     if (signal || lastFramePlayed)
     {
         pthread_mutex_lock(&audioPlayer->playerMutex);
         
-        OSSpinLockLock(&audioPlayer->currentEntryReferencesLock);
+        setLock(&audioPlayer->currentEntryReferencesLock);
         STKQueueEntry* currentlyPlayingEntry = audioPlayer->currentlyPlayingEntry;
-        OSSpinLockUnlock(&audioPlayer->currentEntryReferencesLock);
+        lockUnlock(&audioPlayer->currentEntryReferencesLock);
        
         if (lastFramePlayed && entry == currentlyPlayingEntry)
         {
@@ -3080,15 +3147,15 @@ static OSStatus OutputRenderCallback(void* inRefCon, AudioUnitRenderActionFlags*
             
             while (extraFramesPlayedNotAssigned > 0)
             {
-                OSSpinLockLock(&audioPlayer->currentEntryReferencesLock);
+                setLock(&audioPlayer->currentEntryReferencesLock);
                 STKQueueEntry* newEntry = audioPlayer->currentlyPlayingEntry;
-                OSSpinLockUnlock(&audioPlayer->currentEntryReferencesLock);
+                lockUnlock(&audioPlayer->currentEntryReferencesLock);
                 
                 if (newEntry != nil)
                 {
                     SInt64 framesPlayedForCurrent = extraFramesPlayedNotAssigned;
                     
-                    OSSpinLockLock(&newEntry->spinLock);
+                    setLock(&newEntry->spinLock);
                     
                     if (newEntry->lastFrameQueued > 0)
                     {
@@ -3099,13 +3166,13 @@ static OSStatus OutputRenderCallback(void* inRefCon, AudioUnitRenderActionFlags*
                     
                     if (newEntry->framesPlayed == newEntry->lastFrameQueued)
                     {
-                        OSSpinLockUnlock(&newEntry->spinLock);
+                        lockUnlock(&newEntry->spinLock);
                         
                         [audioPlayer audioQueueFinishedPlaying:newEntry];
                     }
                     else
                     {
-                        OSSpinLockUnlock(&newEntry->spinLock);
+                        lockUnlock(&newEntry->spinLock);
                     }
                     
                     extraFramesPlayedNotAssigned -= framesPlayedForCurrent;
@@ -3351,7 +3418,7 @@ static OSStatus OutputRenderCallback(void* inRefCon, AudioUnitRenderActionFlags*
 	
 	NSArray* replacement = [NSArray arrayWithArray:newFrameFilters];
 	
-	OSSpinLockLock(&pcmBufferSpinLock);
+	setLock(&pcmBufferSpinLock);
 	if (newFrameFilters.count > 0)
 	{
 		frameFilters = replacement;
@@ -3360,7 +3427,7 @@ static OSStatus OutputRenderCallback(void* inRefCon, AudioUnitRenderActionFlags*
 	{
 		frameFilters = nil;
 	}
-	OSSpinLockUnlock(&pcmBufferSpinLock);
+	lockUnlock(&pcmBufferSpinLock);
 	
 	pthread_mutex_unlock(&self->playerMutex);
 }
@@ -3391,9 +3458,9 @@ static OSStatus OutputRenderCallback(void* inRefCon, AudioUnitRenderActionFlags*
 	
 	NSArray* replacement = [NSArray arrayWithArray:newFrameFilters];
 	
-	OSSpinLockLock(&pcmBufferSpinLock);
+	setLock(&pcmBufferSpinLock);
 	frameFilters = replacement;
-	OSSpinLockUnlock(&pcmBufferSpinLock);
+	lockUnlock(&pcmBufferSpinLock);
 	
 	pthread_mutex_unlock(&self->playerMutex);
 }
@@ -3424,9 +3491,9 @@ static OSStatus OutputRenderCallback(void* inRefCon, AudioUnitRenderActionFlags*
 	
 	NSArray* replacement = [NSArray arrayWithArray:newFrameFilters];
 	
-	OSSpinLockLock(&pcmBufferSpinLock);
+	setLock(&pcmBufferSpinLock);
 	frameFilters = replacement;
-	OSSpinLockUnlock(&pcmBufferSpinLock);
+	lockUnlock(&pcmBufferSpinLock);
 	
 	pthread_mutex_unlock(&self->playerMutex);
 }
